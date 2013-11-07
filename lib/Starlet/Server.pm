@@ -123,10 +123,15 @@ sub accept_loop {
     };
 
     local $SIG{PIPE} = 'IGNORE';
-
-    while (! defined $max_reqs_per_child || $proc_req_count < $max_reqs_per_child) {
+    sub do_accept {
+        my $listen = shift;
         my ($conn,$peer);
-        if ( $peer = accept($conn, $self->{listen_sock}) ) {
+        use open 'IO' => ':unix';
+        $peer = accept($conn, $listen);
+        return ($conn, $peer);
+    }
+    while (! defined $max_reqs_per_child || $proc_req_count < $max_reqs_per_child) {
+        if ( my ($conn, $peer) = do_accept($self->{listen_sock}) ) {
             $self->{_is_deferred_accept} = $self->{_using_defer_accept};
             fh_nonblocking( $conn, 1)
                 or die "failed to set socket to nonblocking mode:$!";
@@ -144,8 +149,8 @@ sub accept_loop {
                 ++$req_count;
                 ++$proc_req_count;
                 my $env = {
-                    SERVER_PORT => $self->{port},
-                    SERVER_NAME => $self->{host},
+                    SERVER_PORT => $self->{port} || 0,
+                    SERVER_NAME => $self->{host} || 0,
                     SCRIPT_NAME => '',
                     REMOTE_ADDR => $peeraddr,
                     REMOTE_PORT => $peerport,
