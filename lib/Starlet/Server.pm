@@ -13,6 +13,7 @@ use Plack::Util;
 use Plack::TempBuffer;
 use POSIX qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(IPPROTO_TCP TCP_NODELAY);
+use AnyEvent::Util qw(fh_nonblocking);
 
 use Try::Tiny;
 use Time::HiRes qw(time);
@@ -29,6 +30,7 @@ sub new {
     my $self = bless {
         host                 => $args{host} || 0,
         port                 => $args{port} || 8080,
+        socket_path          => (defined $args{socket_path}) ? $args{socket_path} : undef,
         timeout              => $args{timeout} || 300,
         keepalive_timeout    => $args{keepalive_timeout} || 2,
         max_keepalive_reqs   => $args{max_keepalive_reqs} || 1,
@@ -68,19 +70,39 @@ sub run {
 
 sub setup_listener {
     my $self = shift;
-    $self->{listen_sock} ||= IO::Socket::INET->new(
-        Listen    => SOMAXCONN,
-        LocalPort => $self->{port},
-        LocalAddr => $self->{host},
-        Proto     => 'tcp',
-        ReuseAddr => 1,
-    ) or die "failed to listen to port $self->{port}:$!";
-
-    # set defer accept
-    if ($^O eq 'linux') {
-        setsockopt($self->{listen_sock}, IPPROTO_TCP, 9, 1)
-            and $self->{_using_defer_accept} = 1;
+    if ( my $path = $self->{socket_path} ) {
+        if (-S $path) {
+            warn "removing existing socket file:$path";
+            unlink $path
+                or die "failed to remove existing socket file:$path:$!";
+        }
+        unlink $path;
+        my $saved_umask = umask(0);
+        $self->{listen_sock} = IO::Socket::UNIX->new(
+            Listen => Socket::SOMAXCONN(),
+            Local  => $path,
+        ) or die "failed to listen to socket $path:$!";
+        umask($saved_umask);
+        $self->{use_unix_domain} = 1;
+        $self->{_using_defer_accept} = 1;
     }
+    else {
+        $self->{listen_sock} ||= IO::Socket::INET->new(
+            Listen    => SOMAXCONN,
+            LocalPort => $self->{port},
+            LocalAddr => $self->{host},
+            Proto     => 'tcp',
+            ReuseAddr => 1,
+        ) or die "failed to listen to port $self->{port}:$!";
+
+        # set defer accept
+        if ($^O eq 'linux') {
+            setsockopt($self->{listen_sock}, IPPROTO_TCP, 9, 1)
+                and $self->{_using_defer_accept} = 1;
+        }
+
+    }
+
 
     $self->{server_ready}->($self);
 }
@@ -103,14 +125,18 @@ sub accept_loop {
     local $SIG{PIPE} = 'IGNORE';
 
     while (! defined $max_reqs_per_child || $proc_req_count < $max_reqs_per_child) {
-        if (my ($conn,$peer) = $self->{listen_sock}->accept) {
+        my ($conn,$peer);
+        if ( $peer = accept($conn, $self->{listen_sock}) ) {
             $self->{_is_deferred_accept} = $self->{_using_defer_accept};
-            $conn->blocking(0)
+            fh_nonblocking( $conn, 1)
                 or die "failed to set socket to nonblocking mode:$!";
-            $conn->setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
-                or die "setsockopt(TCP_NODELAY) failed:$!";
-            my ($peerport,$peerhost) = unpack_sockaddr_in $peer;
-            my $peeraddr = inet_ntoa($peerhost);
+            my ($peerport,$peerhost, $peeraddr) = (0, undef, undef);
+            if ( !$self->{use_unix_domain} ) {
+                setsockopt($conn, IPPROTO_TCP, TCP_NODELAY, 1)
+                    or die "setsockopt(TCP_NODELAY) failed:$!";
+                ($peerport,$peerhost) = unpack_sockaddr_in $peer;
+                $peeraddr = inet_ntoa($peerhost);
+            }
             my $req_count = 0;
             my $pipelined_buf = '';
 
