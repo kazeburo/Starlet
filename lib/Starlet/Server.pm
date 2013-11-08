@@ -13,7 +13,8 @@ use Plack::Util;
 use Plack::TempBuffer;
 use POSIX qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(IPPROTO_TCP TCP_NODELAY);
-use AnyEvent::Util qw(fh_nonblocking);
+use Sys::Sendfile;
+use Linux::Socket::Accept4;
 
 use Try::Tiny;
 use Time::HiRes qw(time);
@@ -41,7 +42,7 @@ sub new {
                 ? $args{min_reqs_per_child} : undef,
         ),
         max_reqs_per_child   => (
-            $args{max_reqs_per_child} || $args{max_requests} || 100,
+            $args{max_reqs_per_child} || $args{max_requests} || 1000,
         ),
         spawn_interval       => $args{spawn_interval} || 0,
         err_respawn_interval => (
@@ -127,14 +128,12 @@ sub accept_loop {
         my $listen = shift;
         my ($conn,$peer);
         use open 'IO' => ':unix';
-        $peer = accept($conn, $listen);
+        $peer = accept4($conn, $listen, SOCK_CLOEXEC|SOCK_NONBLOCK);
         return ($conn, $peer);
     }
     while (! defined $max_reqs_per_child || $proc_req_count < $max_reqs_per_child) {
         if ( my ($conn, $peer) = do_accept($self->{listen_sock}) ) {
             $self->{_is_deferred_accept} = $self->{_using_defer_accept};
-            fh_nonblocking( $conn, 1)
-                or die "failed to set socket to nonblocking mode:$!";
             my ($peerport,$peerhost, $peeraddr) = (0, undef, undef);
             if ( !$self->{use_unix_domain} ) {
                 setsockopt($conn, IPPROTO_TCP, TCP_NODELAY, 1)
@@ -388,7 +387,7 @@ sub _handle_response {
     push @lines, "\015\012";
     
     if (defined $body && ref $body eq 'ARRAY' && @$body == 1
-            && length $body->[0] < 8192) {
+            && length $body->[0] < 16384) {
         # combine response header and small request body
         my $buf = $body->[0];
         if ($use_chunked ) {
@@ -400,6 +399,26 @@ sub _handle_response {
         );
         return;
     }
+
+    if ( !$use_chunked
+      && defined $body && ref $body ne 'ARRAY'
+      && fileno($body) ) {
+        my $cl = $send_headers{'content-length'} || -s $body;
+        # sendfile
+        my $use_cork = 0;
+        if ( $^O eq 'linux' && !$self->{use_unix_domain} ) {
+            setsockopt($conn, IPPROTO_TCP, 3, 1)
+                and $use_cork = 1;
+        }
+        $self->write_all($conn, join('', @lines), $self->{timeout})
+            or return;
+        my $len = $self->sendfile_all($conn, $body, $cl, $self->{timeout});
+        if ( $use_cork && $$use_keepalive_r && !$self->{use_unix_domain} ) {
+            setsockopt($conn, IPPROTO_TCP, 3, 0);
+        }
+        return;
+    }
+
     $self->write_all($conn, join('', @lines), $self->{timeout})
         or return;
 
@@ -454,9 +473,13 @@ sub do_io {
     }
  DO_READWRITE:
     # try to do the IO
-    if ($is_write) {
+    if ($is_write && $is_write == 1) {
         $ret = syswrite $sock, $buf, $len, $off
             and return $ret;
+    } elsif ($is_write && $is_write == 2) {
+        $ret = Sys::Sendfile::sendfile($sock, $buf, $len)
+            and return $ret;
+        $ret = undef if defined $ret && $ret == 0 && $! == EAGAIN; #hmm
     } else {
         $ret = sysread $sock, $$buf, $len, $off
             and return $ret;
@@ -508,5 +531,23 @@ sub write_all {
     }
     return length $buf;
 }
+
+sub sendfile_timeout {
+    my ($self, $sock, $fh, $len, $off, $timeout) = @_;
+    $self->do_io(2, $sock, $fh, $len, $off, $timeout);
+}
+
+sub sendfile_all {
+    my ($self, $sock, $fh, $cl, $timeout) = @_;
+    my $off = 0;
+    while (my $len = $cl - $off) {
+        my $ret = $self->sendfile_timeout($sock, $fh, $len, $off, $timeout)
+            or return;
+        $off += $ret;
+        seek($fh, $off, 0) if $cl != $off;
+    }
+    return $cl;
+}
+
 
 1;
