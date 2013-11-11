@@ -14,6 +14,7 @@ use Plack::TempBuffer;
 use POSIX qw(EINTR EAGAIN EWOULDBLOCK);
 use Socket qw(IPPROTO_TCP TCP_NODELAY);
 use Sys::Sendfile;
+use AnyEvent::Util qw/fh_nonblocking/;
 
 use Try::Tiny;
 use Time::HiRes qw(time);
